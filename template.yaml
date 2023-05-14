@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ---
+Parameters: 
+  ApplicationDomain:
+    Type: String
+    Default: hoge.fuga.tak1wa.com
+  HostZoneId: 
+    Type: String
+    Default: Z05132602TL6PL61SUQV2
+  BaseAMI:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources: 
+  #######################
+  # Route 53 & ACM
+  #######################
+  DnsWebRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Ref ApplicationDomain
+      Type: CNAME
+      TTL: 300
+      HostedZoneId: !Ref HostZoneId
+      ResourceRecords:
+        - !GetAtt HogeEndpoint.EndpointDomain
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref ApplicationDomain
+      DomainValidationOptions:
+        - DomainName: !Ref ApplicationDomain
+          HostedZoneId: !Ref HostZoneId
+      ValidationMethod: DNS
+
+  #######################
+  # Network
+  #######################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.100.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      AvailabilityZone: !Select [ 0, "Fn::GetAZs": {Ref: "AWS::Region"}]
+      CidrBlock: 10.100.0.0/24
+      VpcId: !Ref VPC
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  ProtectedSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      AvailabilityZone: !Select [ 0, "Fn::GetAZs": {Ref: "AWS::Region"}]
+      CidrBlock: 10.100.10.0/24
+      VpcId: !Ref VPC
+  ProtectedSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProtectedSubnet1
+      RouteTableId: !Ref ProtectedRouteTable1
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EipNatGateway1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+  EipNatGateway1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  ProtectedRouteTable1:
+    Type: AWS::EC2::RouteTable
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref VPC    
+  ProtectedRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ProtectedRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  HogeSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+        GroupDescription: "hoge"
+        GroupName: !Sub ${AWS::StackName}-allow-sg
+        VpcId: !Ref VPC
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+
+  ########################
+  # Web Server - EC2
+  ########################
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 8
+            DeleteOnTermination: true
+            Encrypted: true
+      ImageId: !Ref BaseAMI
+      IamInstanceProfile: !Ref WebProfile
+      DisableApiTermination: false
+      EbsOptimized: true
+      UserData: 
+        Fn::Base64: |
+            #cloud-config
+            package_update: true
+            package_upgrade: true
+            runcmd:
+            - yum update -y
+            - yum install httpd -y
+            - service httpd start
+            - chkconfig httpd on
+            - echo "hoge" > /var/www/html/index.html
+            write_files:
+            - path: /var/www/html/index.html
+              permissions: 0644
+              owner: root
+              content: |
+                hoge.html
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref MyNetworkInterface
+          DeviceIndex: "0"
+  MyNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref ProtectedSubnet1
+      GroupSet:
+        - !Ref WebServerSecurityGroup
+  WebServerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "hoge"
+      GroupName: !Sub ${AWS::StackName}-web-sg
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref HogeSecurityGroup
+  WebProfile: 
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: "/"
+      Roles: 
+        - !Ref WebRole
+      InstanceProfileName: !Sub ${AWS::StackName}-web-profile
+  WebRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+        Path: "/"
+        RoleName: !Sub ${AWS::StackName}-web-role
+        AssumeRolePolicyDocument: 
+          Version: 2012-10-17
+          Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+        ManagedPolicyArns: 
+          - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  #######################
+  # Verified Access
+  #######################
+  HogeInstance:
+    Type: AWS::EC2::VerifiedAccessInstance
+    Properties: 
+      VerifiedAccessTrustProviderIds: 
+        - !Ref HogeTrustProvider
+
+  HogeTrustProvider:
+    Type: AWS::EC2::VerifiedAccessTrustProvider
+    Properties: 
+      PolicyReferenceName: !Sub ${AWS::StackName}policy
+      TrustProviderType: user
+      UserTrustProviderType: iam-identity-center
+
+  HogeGroup:
+    Type: AWS::EC2::VerifiedAccessGroup
+    Properties: 
+      PolicyDocument: "permit(principal,action,resource) when { true };"
+      PolicyEnabled: true
+      VerifiedAccessInstanceId: !Ref HogeInstance
+
+  HogeEndpoint:
+    Type: AWS::EC2::VerifiedAccessEndpoint
+    Properties: 
+      ApplicationDomain: !Ref ApplicationDomain
+      AttachmentType: vpc
+      DomainCertificateArn: !Ref Certificate
+      EndpointDomainPrefix: !Sub ${AWS::StackName}
+      EndpointType: network-interface
+      NetworkInterfaceOptions:
+        NetworkInterfaceId: !Ref MyNetworkInterface
+        Port: 80
+        Protocol: http
+      SecurityGroupIds:
+        - !Ref HogeSecurityGroup
+      VerifiedAccessGroupId: !Ref HogeGroup
